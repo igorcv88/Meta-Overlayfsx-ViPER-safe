@@ -1,3 +1,17 @@
+## v1.3.4-viper-safe.1 - Granular ViPER mounts
+
+### ViPER4Android RE (AIDL)
+
+- Excludes `ViPER4Android-RE-AIDL` from the normal partition-root OverlayFS pass.
+- Keeps `/vendor` and `/system` on their original mounts instead of overlaying the entire partition for ViPER.
+- Bind-mounts patched `audio_effects*.xml` / `audio_effects*.conf` files individually.
+- Builds a complete stock + ViPER mirror of each existing `lib*/soundfx` directory and bind-mounts only that directory.
+- Allows only the known `system/vendor -> ../vendor` compatibility symlink; unexpected ViPER partition payloads fail closed instead of falling back to a broad root overlay.
+- Skips the unused 32-bit `soundfx` payload when the live device has no corresponding directory.
+- Detects already-active ViPER granular mounts to avoid stacking mounts across repeated soft reboots.
+- Refuses activation over a stale legacy ViPER `/vendor` or `/system` root overlay and requires a full reboot first.
+- Removed the upstream `updateJson` from `module.prop` so an automatic update cannot replace this fork with the non-ViPER-safe build.
+
 ## v1.3.4 - Kernel Inspector & Next-Gen WebUI
 
 ### ✨ New Features
