@@ -27,6 +27,69 @@ mountinfo_for() {
     awk -v p="$target" '$5 == p {print; exit}' /proc/self/mountinfo 2>/dev/null
 }
 
+v4a_selinux_context_for() {
+    local target="$1"
+
+    ls -Zd "$target" 2>/dev/null | awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^u:object_r:[^:]+:s[0-9]/) {
+                    print $i
+                    exit
+                }
+            }
+        }
+    '
+}
+
+v4a_relabel_like_target() {
+    local target="$1"
+    local staged="$2"
+    local recursive="$3"
+    local expected actual probe
+
+    expected="$(v4a_selinux_context_for "$target")"
+    if [ -z "$expected" ]; then
+        log ERROR "Unable to determine SELinux context for ViPER target: $target"
+        return 1
+    fi
+
+    if [ "$recursive" = "1" ]; then
+        chcon -R "$expected" "$staged" || {
+            log ERROR "Failed to relabel ViPER tree to $expected: $staged"
+            return 1
+        }
+    else
+        chcon "$expected" "$staged" || {
+            log ERROR "Failed to relabel ViPER file to $expected: $staged"
+            return 1
+        }
+    fi
+
+    actual="$(v4a_selinux_context_for "$staged")"
+    if [ "$actual" != "$expected" ]; then
+        log ERROR "ViPER SELinux context mismatch: staged=$actual expected=$expected path=$staged"
+        return 1
+    fi
+
+    if [ "$recursive" = "1" ]; then
+        # Verify at least one child too.  Directory-only validation would miss
+        # the exact failure that caused QTI EffectConfig to skip every soundfx
+        # library when the mirror children remained system_file.
+        probe="$(find "$staged" -type f -print 2>/dev/null | head -n 1)"
+        if [ -n "$probe" ]; then
+            actual="$(v4a_selinux_context_for "$probe")"
+            if [ "$actual" != "$expected" ]; then
+                log ERROR "ViPER child SELinux context mismatch: staged=$actual expected=$expected path=$probe"
+                return 1
+            fi
+        fi
+    fi
+
+    log INFO "ViPER staged path relabeled to $expected: $staged"
+    return 0
+}
+
 v4a_mount_already_active() {
     local target="$1"
     local line
@@ -183,7 +246,7 @@ v4a_validate_and_plan() {
 v4a_prepare_soundfx_bind() {
     local dst="$1"
     local srcs="$2"
-    local rel work src mode rc
+    local rel work src mode owner rc
 
     # The AIDL stack on some 64-bit-only devices has no /vendor/lib/soundfx.
     # A 32-bit payload for an absent live directory is harmless and should not
@@ -227,9 +290,21 @@ v4a_prepare_soundfx_bind() {
     done
     IFS="$OLD_IFS"
 
-    mode="$(stat -c '%a' "$dst" 2>/dev/null)"
-    [ -n "$mode" ] && chmod "$mode" "$work" 2>/dev/null
-    chcon --reference="$dst" "$work" 2>/dev/null || true
+    mode="$(stat -c '%a' "$dst" 2>/dev/null)" || mode=""
+    owner="$(stat -c '%u:%g' "$dst" 2>/dev/null)" || owner=""
+    if [ -z "$mode" ] || [ -z "$owner" ]; then
+        log ERROR "Failed to read stock soundfx metadata: $dst"
+        return 1
+    fi
+    chmod "$mode" "$work" || {
+        log ERROR "Failed to preserve soundfx directory mode $mode: $work"
+        return 1
+    }
+    chown "$owner" "$work" || {
+        log ERROR "Failed to preserve soundfx directory owner $owner: $work"
+        return 1
+    }
+    v4a_relabel_like_target "$dst" "$work" 1 || return 1
 
     log INFO "Bind mounting merged ViPER soundfx directory: $dst"
     mount -o bind "$work" "$dst" || {
@@ -237,13 +312,26 @@ v4a_prepare_soundfx_bind() {
         return 1
     }
 
+    # Verify the live bind, including the ViPER library when this target carries
+    # it. This catches mount/label regressions before QTI silently skips entries.
+    if [ -f "$work/libv4a_aidl.so" ]; then
+        local expected live_context
+        expected="$(v4a_selinux_context_for "$dst")"
+        live_context="$(v4a_selinux_context_for "$dst/libv4a_aidl.so")"
+        if [ -z "$expected" ] || [ "$live_context" != "$expected" ]; then
+            log ERROR "Live ViPER library context mismatch: live=$live_context expected=$expected path=$dst/libv4a_aidl.so"
+            umount "$dst" 2>/dev/null || true
+            return 1
+        fi
+    fi
+
     return 0
 }
 
 v4a_prepare_config_bind() {
     local dst="$1"
     local src="$2"
-    local safe_name work_file mode rc
+    local safe_name work_file mode owner rc
 
     [ -f "$dst" ] || {
         log ERROR "Stock audio effects config disappeared: $dst"
@@ -269,9 +357,21 @@ v4a_prepare_config_bind() {
         return 1
     }
 
-    mode="$(stat -c '%a' "$dst" 2>/dev/null)"
-    [ -n "$mode" ] && chmod "$mode" "$work_file" 2>/dev/null
-    chcon --reference="$dst" "$work_file" 2>/dev/null || true
+    mode="$(stat -c '%a' "$dst" 2>/dev/null)" || mode=""
+    owner="$(stat -c '%u:%g' "$dst" 2>/dev/null)" || owner=""
+    if [ -z "$mode" ] || [ -z "$owner" ]; then
+        log ERROR "Failed to read stock config metadata: $dst"
+        return 1
+    fi
+    chmod "$mode" "$work_file" || {
+        log ERROR "Failed to preserve config mode $mode: $work_file"
+        return 1
+    }
+    chown "$owner" "$work_file" || {
+        log ERROR "Failed to preserve config owner $owner: $work_file"
+        return 1
+    }
+    v4a_relabel_like_target "$dst" "$work_file" 0 || return 1
 
     log INFO "Bind mounting ViPER config: $dst"
     mount -o bind "$work_file" "$dst" || {
