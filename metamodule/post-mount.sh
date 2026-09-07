@@ -1,3 +1,4 @@
 #!/system/bin/sh
 
-ksud kernel nuke-ext4-sysfs /data/adb/modules/overlayfsx/mnt
+MODDIR="${0%/*}"
+ksud kernel nuke-ext4-sysfs "$MODDIR/mnt"
