@@ -16,6 +16,7 @@ MODULE_METADATA_DIR_REAL="/data/adb/modules"
 LOG_FILE="$META_DIR/overlayfsx.log"
 
 . "$META_DIR"/viper_safe.sh || exit 1
+. "$META_DIR"/viper_lifecycle.sh || exit 1
 
 log INFO "Starting module mount process"
 
@@ -136,9 +137,25 @@ fi
 
 # Mount ViPER only at audio_effects config files and soundfx directories.
 if [ "$V4A_ACTIVE" -eq 1 ]; then
+    # Staged updates can replace a work_cfg backing inode while an older bind
+    # remains attached to the deleted inode. Remove only those stale ViPER
+    # binds so the granular mount pass can recreate them from current payloads.
+    v4a_cleanup_deleted_binds || {
+        log ERROR "Failed to remove stale deleted-backed ViPER bind(s)"
+        exit 76
+    }
+
     v4a_mount_granular || {
         log ERROR "ViPER-safe mount failed; broad partition fallback is disabled"
         exit 76
+    }
+
+    # Late-load may happen after Samsung's QTI Effect Factory has already
+    # parsed audio_effects*.xml. If the live Factory still does not map the
+    # ViPER AIDL library, restart only the audio stack and verify the new HAL.
+    v4a_reload_audio_stack_if_needed || {
+        log ERROR "ViPER mounts are live but audio stack reload/verification failed"
+        exit 77
     }
 fi
 
