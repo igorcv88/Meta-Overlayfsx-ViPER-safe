@@ -1,3 +1,14 @@
+## v1.3.4-viper-safe.3 - Late-mount audio lifecycle repair
+
+### ViPER4Android RE (AIDL)
+
+- Repairs stale ViPER bind mounts whose staged backing inode was replaced by a module update and now appears as `//deleted` / `(deleted)` in mountinfo.
+- After granular ViPER mounts succeed, checks whether the live AIDL Effect Factory already maps `libv4a_aidl.so` and skips any restart when the audio stack is already healthy.
+- On late-load systems where Samsung/QTI audio was already running with its pre-ViPER effect inventory, restarts `vendor.audio-hal-aidl`, waits for a new Effect Factory PID, and fails closed unless the new HAL actually maps `libv4a_aidl.so`.
+- Restarts `audioserver` only after the reloaded HAL has proven that the ViPER library is mapped, and verifies the audioserver PID transition.
+- Does not restart audio during normal early boot when `vendor.audio-hal-aidl` is not running yet; the HAL will parse the already-mounted configuration on its normal startup.
+- Keeps this lifecycle repair scoped to the ViPER granular path instead of the generic `post-mount.sh`, so Meta-Overlayfsx use without ViPER is unchanged.
+
 ## v1.3.4-viper-safe.2 - Persistent late-load ViPER mounts
 
 ### ViPER4Android RE (AIDL)
