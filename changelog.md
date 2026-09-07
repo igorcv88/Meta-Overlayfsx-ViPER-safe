@@ -1,3 +1,14 @@
+## v1.3.4-viper-safe.2 - Persistent late-load ViPER mounts
+
+### ViPER4Android RE (AIDL)
+
+- Relabels the merged `lib*/soundfx` mirror recursively to the SELinux context of the live target before bind mounting it.
+- Fails closed if the target context cannot be derived, `chcon` fails, or staged/live context validation does not match.
+- Preserves directory ownership and mode and verifies `libv4a_aidl.so` after the live bind.
+- Applies the same target-derived, fail-hard SELinux labeling to individually bound `audio_effects*.xml` / `audio_effects*.conf` files.
+- Removes the unsupported `chcon --reference=... || true` behavior that allowed `system_file` mirrors to replace Samsung `vendor_file` soundfx trees.
+- Fixes `post-mount.sh` to derive the metamodule path from `MODDIR` instead of the stale `/data/adb/modules/overlayfsx` ID.
+
 ## v1.3.4-viper-safe.1 - Granular ViPER mounts
 
 ### ViPER4Android RE (AIDL)
