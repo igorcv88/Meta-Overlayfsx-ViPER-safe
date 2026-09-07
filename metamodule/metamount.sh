@@ -2,9 +2,9 @@
 ############################################
 # overlayfsx metamount.sh
 # Module mount handler for dual-directory mounting
+# ViPER-safe adaptation: ViPER4Android-RE-AIDL is mounted granularly.
 ############################################
 
-# Force canonical symlink path to prevent VFS double-mount collisions
 META_DIR="/data/adb/metamodule"
 
 . "$META_DIR"/utils.sh || exit 1
@@ -12,8 +12,10 @@ IMG_FILE="$META_DIR/modules.img"
 MNT_DIR="$META_DIR/mnt"
 RW_ROOT="/data/adb/modules/.rw"
 PARTITIONS="system vendor product system_ext odm oem"
-MODULE_METADATA_DIR="/data/adb/modules"
+MODULE_METADATA_DIR_REAL="/data/adb/modules"
 LOG_FILE="$META_DIR/overlayfsx.log"
+
+. "$META_DIR"/viper_safe.sh || exit 1
 
 log INFO "Starting module mount process"
 
@@ -37,47 +39,40 @@ else
     log INFO "Image already mounted at $MNT_DIR"
 fi
 
-# Binary path
 BINARY="$META_DIR/overlayfsx"
-
 if [ ! -f "$BINARY" ]; then
     log ERROR "Binary not found: $BINARY"
     exit 1
 fi
 
-# Apply staged updates from the ext4 image before generating the mount tree
+# Apply staged updates before generating the mount tree.
 log INFO "Applying pending module updates in image..."
 for update_dir in "$MNT_DIR"/*_update; do
     if [ -d "$update_dir" ]; then
         original_dir="${update_dir%_update}"
         MODULE_NAME=$(basename "$original_dir")
         log INFO "Swapping staged update for: $MODULE_NAME"
-
-        # Atomic swap: Delete old live module and rename the update
         rm -rf "$original_dir"
         mv "$update_dir" "$original_dir"
     fi
 done
 
-# Cleanup orphaned/skip_mount modules from image
+# Cleanup orphaned/skip_mount modules from image.
 log INFO "Checking for orphaned modules and skip_mount flags..."
 REMOVED_COUNT=0
-
 for module_dir in "$MNT_DIR"/*; do
     if [ ! -d "$module_dir" ] || [ "$(basename "$module_dir")" = "lost+found" ] || echo "$module_dir" | grep -q "_update$"; then
         continue
     fi
 
     MODULE_NAME=$(basename "$module_dir")
-    METADATA_PATH="$MODULE_METADATA_DIR/$MODULE_NAME"
+    METADATA_PATH="$MODULE_METADATA_DIR_REAL/$MODULE_NAME"
     SHOULD_REMOVE=false
     REMOVE_REASON=""
 
-    # Check if module still exists in metadata directory
     if [ ! -d "$METADATA_PATH" ]; then
         SHOULD_REMOVE=true
         REMOVE_REASON="orphaned"
-    # Check if module has skip_mount flag
     elif [ -f "$METADATA_PATH/skip_mount" ]; then
         SHOULD_REMOVE=true
         REMOVE_REASON="skip_mount"
@@ -90,52 +85,70 @@ for module_dir in "$MNT_DIR"/*; do
     fi
 done
 
-if [ $REMOVED_COUNT -gt 0 ]; then
+if [ "$REMOVED_COUNT" -gt 0 ]; then
     log INFO "Removed $REMOVED_COUNT module(s) from image"
 else
     log INFO "No modules to remove from image"
 fi
 
-# Apply SELinux contexts for .rw partition structures
+# Refuse to stack this safe implementation over a stale ViPER root overlay.
+v4a_check_stale_root_overlay || exit $?
+
+# A root overlay from another module is outside the ViPER exception.
+v4a_warn_other_root_overlays
+
+# Apply SELinux contexts for .rw partition structures.
 if [ -d "$RW_ROOT" ]; then
     log INFO "Applying SELinux contexts for RW partition structures"
-
     for part in $PARTITIONS; do
         PART_DIR="$RW_ROOT/$part"
         REFERENCE_PATH="/$part"
         if [ -d "$PART_DIR" ] && [ -e "$REFERENCE_PATH" ]; then
             chcon --reference="$REFERENCE_PATH" "$PART_DIR" 2>/dev/null
-            UPPER_DIR="$PART_DIR/upperdir"
-            if [ -d "$UPPER_DIR" ]; then
-                chcon --reference="$PART_DIR" "$UPPER_DIR" 2>/dev/null
-            fi
-            WORK_DIR="$PART_DIR/workdir"
-            if [ -d "$WORK_DIR" ]; then
-                chcon --reference="$PART_DIR" "$WORK_DIR" 2>/dev/null
-            fi
+            [ -d "$PART_DIR/upperdir" ] && chcon --reference="$PART_DIR" "$PART_DIR/upperdir" 2>/dev/null
+            [ -d "$PART_DIR/workdir" ] && chcon --reference="$PART_DIR" "$PART_DIR/workdir" 2>/dev/null
         fi
     done
 fi
 
-# Set dual-directory environment variables
-export MODULE_METADATA_DIR="/data/adb/modules"
+# Exclude only ViPER from the normal partition-root OverlayFS pass. All other
+# modules continue through the upstream OverlayFSx engine unchanged.
+V4A_ACTIVE=0
+if v4a_enabled; then
+    V4A_ACTIVE=1
+    log INFO "$V4A_ID detected; excluding it from partition-root OverlayFS"
+    build_filtered_metadata || {
+        log ERROR "Failed to create filtered metadata view for ViPER"
+        exit 1
+    }
+    export MODULE_METADATA_DIR="$V4A_TMP_META"
+else
+    export MODULE_METADATA_DIR="$MODULE_METADATA_DIR_REAL"
+fi
 export MODULE_CONTENT_DIR="$MNT_DIR"
 
-# Execute the mount binary and inject its output directly into the unified log file
 "$BINARY" >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
-
-if [ $EXIT_CODE -ne 0 ]; then
+if [ "$EXIT_CODE" -ne 0 ]; then
     log ERROR "Mount failed with exit code $EXIT_CODE"
-    exit $EXIT_CODE
+    exit "$EXIT_CODE"
 fi
 
-# Retrieve live mount JSON data to update the module.prop description dynamically
+# Mount ViPER only at audio_effects config files and soundfx directories.
+if [ "$V4A_ACTIVE" -eq 1 ]; then
+    v4a_mount_granular || {
+        log ERROR "ViPER-safe mount failed; broad partition fallback is disabled"
+        exit 76
+    }
+fi
+
+# Restore the real metadata view for inspector/WebUI.
+export MODULE_METADATA_DIR="$MODULE_METADATA_DIR_REAL"
+cleanup_v4a_tmp
+
 log INFO "Analyzing mount state to update UI description..."
 INSPECT_JSON=$("$BINARY" inspect -r 2>/dev/null)
-
 if echo "$INSPECT_JSON" | grep -q '"status": "success"'; then
-    # Parse JSON raw via grep to avoid requiring jq dependency
     MODULE_COUNT=$(echo "$INSPECT_JSON" | grep -o '"id":' | wc -l)
     CONFLICT_COUNT=$(echo "$INSPECT_JSON" | grep -o '"total_conflicted": [0-9]*' | grep -o '[0-9]*')
 
@@ -144,8 +157,11 @@ if echo "$INSPECT_JSON" | grep -q '"status": "success"'; then
         HAS_CONFLICT="☢️ True"
     fi
 
-    NEW_DESC="📦 Modules Mounted: $MODULE_COUNT | File Conflicts: $HAS_CONFLICT | Next-Gen OverlayFS engine with real-time kernel inspection & native WebUI."
-
+    if [ "$V4A_ACTIVE" -eq 1 ]; then
+        NEW_DESC="📦 Modules Mounted: $MODULE_COUNT | ViPER: 🛡️ Granular | File Conflicts: $HAS_CONFLICT | OverlayFSx ViPER-safe."
+    else
+        NEW_DESC="📦 Modules Mounted: $MODULE_COUNT | File Conflicts: $HAS_CONFLICT | OverlayFSx with ViPER-safe support."
+    fi
     modify_prop "description" "$NEW_DESC" "$META_DIR/module.prop"
 fi
 
