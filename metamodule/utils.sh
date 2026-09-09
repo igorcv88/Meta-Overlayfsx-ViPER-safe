@@ -4,7 +4,16 @@
 # Shared utility functions for module management
 ############################################
 
-LOG_FILE="/data/adb/metamodule/overlayfsx.log"
+# Persistent OverlayFSx state must live outside the metamodule directory.
+# KernelSU replaces /data/adb/modules/<id> atomically on module updates; keeping
+# a live mountpoint below that directory makes remove_dir_all() fail with EBUSY.
+OVERLAYFSX_DATA_DIR="${OVERLAYFSX_DATA_DIR:-/data/adb/overlayfsx-data}"
+IMG_FILE="${IMG_FILE:-$OVERLAYFSX_DATA_DIR/modules.img}"
+MNT_DIR="${MNT_DIR:-$OVERLAYFSX_DATA_DIR/mnt}"
+LEGACY_IMG_FILE="${LEGACY_IMG_FILE:-/data/adb/metamodule/modules.img}"
+LEGACY_MNT_DIR="${LEGACY_MNT_DIR:-/data/adb/metamodule/mnt}"
+LOG_FILE="${LOG_FILE:-/data/adb/metamodule/overlayfsx.log}"
+OVERLAYFSX_BIN="${OVERLAYFSX_BIN:-/data/adb/metamodule/overlayfsx}"
 
 # Unified smart logger (Handles level switching dynamically)
 log() {
@@ -48,7 +57,8 @@ modify_prop() {
     fi
 
     if grep -q "^$prop_key=" "$target_file"; then
-        local safe_value=$(printf '%s\n' "$prop_value" | sed 's/[~&]/\\&/g')
+        local safe_value
+        safe_value=$(printf '%s\n' "$prop_value" | sed 's/[~&]/\\&/g')
         sed -i "s~^$prop_key=.*~$prop_key=$safe_value~" "$target_file" || {
             log ERROR "Failed to modify $prop_key in $(basename "$target_file")"
             return 1
@@ -60,19 +70,91 @@ modify_prop() {
     fi
 }
 
+ensure_overlayfsx_data_dir() {
+    mkdir -p "$OVERLAYFSX_DATA_DIR" || return 1
+    chmod 0700 "$OVERLAYFSX_DATA_DIR" 2>/dev/null || true
+    chcon u:object_r:ksu_file:s0 "$OVERLAYFSX_DATA_DIR" 2>/dev/null || true
+    return 0
+}
+
+# Migrate the legacy image that lived inside /data/adb/metamodule. This is only
+# a fallback for upgrades where customize.sh could not externalize it earlier.
+# Never migrate while the legacy mountpoint is live: the old layout must first
+# be cleared by a full kernel reboot so KernelSU can safely promote the update.
+migrate_legacy_image_if_needed() {
+    [ -f "$IMG_FILE" ] && return 0
+    [ -f "$LEGACY_IMG_FILE" ] || return 1
+
+    if mountpoint -q "$LEGACY_MNT_DIR" 2>/dev/null; then
+        log ERROR "Legacy in-module OverlayFSx mount is still active at $LEGACY_MNT_DIR"
+        log ERROR "A full reboot is required before migrating persistent state"
+        return 75
+    fi
+
+    ensure_overlayfsx_data_dir || return 1
+
+    local tmp_img="$OVERLAYFSX_DATA_DIR/.modules.img.migrate.$$"
+    rm -f "$tmp_img"
+    sync
+
+    if [ -x "$OVERLAYFSX_BIN" ]; then
+        "$OVERLAYFSX_BIN" xcp "$LEGACY_IMG_FILE" "$tmp_img" || {
+            rm -f "$tmp_img"
+            log ERROR "Failed to migrate legacy modules image with overlayfsx xcp"
+            return 1
+        }
+    else
+        cp -af "$LEGACY_IMG_FILE" "$tmp_img" || {
+            rm -f "$tmp_img"
+            log ERROR "Failed to migrate legacy modules image"
+            return 1
+        }
+    fi
+
+    sync
+    chcon u:object_r:ksu_file:s0 "$tmp_img" 2>/dev/null || true
+    mv -f "$tmp_img" "$IMG_FILE" || {
+        rm -f "$tmp_img"
+        return 1
+    }
+    chmod 0600 "$IMG_FILE" 2>/dev/null || true
+    chcon u:object_r:ksu_file:s0 "$IMG_FILE" 2>/dev/null || true
+
+    log INFO "Migrated OverlayFSx image to persistent external state: $IMG_FILE"
+    return 0
+}
+
 # Mount ext4 image if not already mounted
 ensure_image_mounted() {
+    ensure_overlayfsx_data_dir || return 1
+
+    if mountpoint -q "$LEGACY_MNT_DIR" 2>/dev/null; then
+        log ERROR "Refusing to activate while legacy mountpoint is still live: $LEGACY_MNT_DIR"
+        log ERROR "Perform one full reboot before using this release"
+        return 75
+    fi
+
+    if [ ! -f "$IMG_FILE" ]; then
+        migrate_legacy_image_if_needed || {
+            log ERROR "Modules image not found at $IMG_FILE"
+            return 1
+        }
+    fi
+
     if ! mountpoint -q "$MNT_DIR" 2>/dev/null; then
         log "Mounting modules image"
-        mkdir -p "$MNT_DIR"
+        mkdir -p "$MNT_DIR" || return 1
+        chmod 0755 "$MNT_DIR" 2>/dev/null || true
         chcon u:object_r:ksu_file:s0 "$IMG_FILE" 2>/dev/null
         mount -t ext4 -o loop,rw,noatime "$IMG_FILE" "$MNT_DIR" || {
-            log "Failed to mount modules image" && exit 1
+            log ERROR "Failed to mount modules image"
+            return 1
         }
-        log "Image mounted successfully"
+        log "Image mounted successfully at $MNT_DIR"
     else
-        log "Image already mounted"
+        log "Image already mounted at $MNT_DIR"
     fi
+    return 0
 }
 
 # Determine whether this module should be moved into the ext4 image
@@ -103,14 +185,12 @@ copy_selinux_contexts() {
         return 0
     fi
 
-    # Copy context for the root directory
     CHCON_FLAG=""
     if [ -L "$SRC" ]; then
         CHCON_FLAG="-h"
     fi
     chcon $CHCON_FLAG --reference="$SRC" "$DST" 2>/dev/null || true
 
-    # Copy contexts for all subdirectories and files
     find "$SRC" -print 2>/dev/null | while IFS= read -r PATH_SRC; do
         if [ "$PATH_SRC" = "$SRC" ]; then
             continue
@@ -203,12 +283,9 @@ post_install_to_image() {
         chmod 755 "$MNT_DIR" 2>/dev/null || true
     fi
 
-    # Always stage to a pending update folder.
-    # Because this folder is not actively mounted by OverlayFS, the VFS cache is 100% safe.
     log "Staging payload to ${MODID}_update."
     MOD_IMG_DIR="$MNT_DIR/${MODID}_update"
 
-    # Nuke any failed previous staging attempts to ensure a clean slate
     rm -rf "$MOD_IMG_DIR"
     mkdir -p "$MOD_IMG_DIR"
     chmod 755 "$MOD_IMG_DIR" 2>/dev/null || true
@@ -218,7 +295,6 @@ post_install_to_image() {
         if [ -d "$SRC_DIR" ]; then
             log "Copying $partition/ to staging area"
 
-            # Since this is an unmounted staging dir, we can just aggressively copy the whole folder
             cp -af "$SRC_DIR" "$MOD_IMG_DIR/" || {
                 log "Failed to copy $partition"
                 continue
@@ -232,7 +308,6 @@ post_install_to_image() {
     log "Module content staged to image successfully"
 }
 
-# Mark directory for REPLACE mode
 mark_replace() {
     replace_target="$1"
     mkdir -p "$replace_target"
@@ -240,7 +315,6 @@ mark_replace() {
 }
 
 chooseport() {
-  # Original idea by chainfire and ianmacd @xda-developers
   [ "$1" ] && local delay=$1 || local delay=10
   local retry_count=0
   local max_retries=2
@@ -249,17 +323,17 @@ chooseport() {
   while true; do
     local count=0
     while true; do
-      timeout $delay /system/bin/getevent -lqc 1 2>&1 > $TMPDIR/events &
+      timeout $delay /system/bin/getevent -lqc 1 2>&1 > "$TMPDIR/events" &
       sleep 0.5; count=$((count + 1))
-      if (`grep -q 'KEY_VOLUMEUP *DOWN' $TMPDIR/events`); then
+      if grep -q 'KEY_VOLUMEUP *DOWN' "$TMPDIR/events"; then
         return 0
-      elif (`grep -q 'KEY_VOLUMEDOWN *DOWN' $TMPDIR/events`); then
+      elif grep -q 'KEY_VOLUMEDOWN *DOWN' "$TMPDIR/events"; then
         return 1
       fi
-      [ $count -gt 12 ] && break
+      [ "$count" -gt 12 ] && break
     done
     retry_count=$((retry_count + 1))
-    if [ $retry_count -gt $max_retries ]; then
+    if [ "$retry_count" -gt "$max_retries" ]; then
       echo "  > Volume key not detected after $max_retries attempts. Auto-selecting Current Option."
       return 0
     else

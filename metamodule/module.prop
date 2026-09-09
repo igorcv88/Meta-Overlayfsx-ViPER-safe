@@ -1,8 +1,8 @@
 id=meta-overlayfsx
 metamodule=1
 name=OverlayFS Enhanced - ViPER Safe
-version=1.3.4-viper-safe.3
-versionCode=13403
+version=1.3.4-viper-safe.4
+versionCode=13404
 author=AshBorn (@Ripper_Hybrid), KernelSU Devs + igorcv88 ViPER-safe adaptation
-description=OverlayFSx with granular ViPER4Android-RE-AIDL mounts that avoid partition-root /vendor and /system overlays.
+description=OverlayFSx with external persistent state and granular ViPER4Android-RE-AIDL mounts safe for KernelSU late-load updates.
 banner=banner

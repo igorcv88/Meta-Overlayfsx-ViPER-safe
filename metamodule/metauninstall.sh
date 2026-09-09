@@ -1,27 +1,20 @@
 #!/system/bin/sh
 ############################################
 # overlayfsx metauninstall.sh
-# Module uninstallation hook for ext4 image cleanup
+# Regular-module uninstallation hook
 ############################################
 
-MODDIR="${0%/*}"
+MNT_DIR="/data/adb/overlayfsx-data/mnt"
 
-# Constants
-MNT_DIR="/data/adb/metamodule/mnt"
+[ -n "$MODULE_ID" ] || exit 1
 
-if [ -z "$MODULE_ID" ]; then
-    exit 1
-fi
-
-# Check if image is mounted
+# During normal KernelSU pruning this runs before metamount.sh, so the image may
+# not be mounted yet. In that case metamount.sh's orphan cleanup removes the
+# payload later in the same activation sequence.
 if ! mountpoint -q "$MNT_DIR" 2>/dev/null; then
     exit 0
 fi
 
-# Remove module content from image
-MOD_IMG_DIR="$MNT_DIR/$MODULE_ID"
-if [ -d "$MOD_IMG_DIR" ]; then
-    rm -rf "$MOD_IMG_DIR"
-fi
-
+rm -rf "$MNT_DIR/$MODULE_ID" "$MNT_DIR/${MODULE_ID}_update" 2>/dev/null
+sync
 exit 0

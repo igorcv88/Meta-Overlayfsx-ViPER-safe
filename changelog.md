@@ -1,3 +1,15 @@
+## v1.3.4-viper-safe.4 - KernelSU update-safe persistent state
+
+### KernelSU 3.3.0 / late-load update safety
+
+- Moves the mutable OverlayFSx ext4 image and its live mountpoint out of `/data/adb/modules/meta-overlayfsx` into `/data/adb/overlayfsx-data`.
+- Fixes the KernelSU `handle_updated_modules()` `EBUSY` failure caused by trying to remove a metamodule directory that still contained the mounted `mnt/` filesystem during soft-reboot/update promotion.
+- Migrates the legacy in-module `modules.img` to the external state directory during installation, preserving existing staged module payloads.
+- Adds a boot-time migration fallback and fails closed if a legacy in-module mount is still active; upgrading from an older ViPER-safe release requires one full reboot before late-load root is reacquired.
+- Keeps `/data/adb/metamodule` for immutable scripts/binary/log only, so future metamodule updates can be promoted while the external content image remains mounted.
+- Updates WebUI, post-mount sysfs hiding, module installer/uninstaller hooks, and the Rust fallback content path to the new external state location.
+- Uninstall cleanup now removes external state only after the image can be safely unmounted; if backing storage is unexpectedly busy it is preserved rather than lazily detached from active overlays.
+
 ## v1.3.4-viper-safe.3 - Late-mount audio lifecycle repair
 
 ### ViPER4Android RE (AIDL)

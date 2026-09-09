@@ -8,37 +8,52 @@
 META_DIR="/data/adb/metamodule"
 
 . "$META_DIR"/utils.sh || exit 1
-IMG_FILE="$META_DIR/modules.img"
-MNT_DIR="$META_DIR/mnt"
+
+# Persistent mutable state is external to /data/adb/modules/meta-overlayfsx so
+# KernelSU can atomically replace the metamodule directory without EBUSY.
+OVERLAYFSX_DATA_DIR="/data/adb/overlayfsx-data"
+IMG_FILE="$OVERLAYFSX_DATA_DIR/modules.img"
+MNT_DIR="$OVERLAYFSX_DATA_DIR/mnt"
+LEGACY_IMG_FILE="$META_DIR/modules.img"
+LEGACY_MNT_DIR="$META_DIR/mnt"
 RW_ROOT="/data/adb/modules/.rw"
 PARTITIONS="system vendor product system_ext odm oem"
 MODULE_METADATA_DIR_REAL="/data/adb/modules"
 LOG_FILE="$META_DIR/overlayfsx.log"
+OVERLAYFSX_BIN="$META_DIR/overlayfsx"
+
+# Re-export after overriding defaults from utils.sh.
+export OVERLAYFSX_DATA_DIR IMG_FILE MNT_DIR LEGACY_IMG_FILE LEGACY_MNT_DIR LOG_FILE OVERLAYFSX_BIN
 
 . "$META_DIR"/viper_safe.sh || exit 1
 . "$META_DIR"/viper_lifecycle.sh || exit 1
 
 log INFO "Starting module mount process"
 
-# Ensure ext4 image is mounted
-if ! mountpoint -q "$MNT_DIR" 2>/dev/null; then
-    log INFO "Image not mounted, mounting now..."
-
-    if [ ! -f "$IMG_FILE" ]; then
-        log ERROR "Image file not found at $IMG_FILE"
-        exit 1
-    fi
-
-    mkdir -p "$MNT_DIR"
-    chcon u:object_r:ksu_file:s0 "$IMG_FILE" 2>/dev/null
-    mount -t ext4 -o loop,rw,noatime "$IMG_FILE" "$MNT_DIR" || {
-        log ERROR "Failed to mount image"
-        exit 1
-    }
-    log INFO "Image mounted successfully at $MNT_DIR"
-else
-    log INFO "Image already mounted at $MNT_DIR"
+# If an old release is somehow still mounted under the metamodule directory,
+# activating the new layout in the same kernel boot would preserve the exact
+# EBUSY condition this release fixes. Fail closed and require a real reboot.
+if mountpoint -q "$LEGACY_MNT_DIR" 2>/dev/null; then
+    log ERROR "Legacy OverlayFSx mount is still active at $LEGACY_MNT_DIR"
+    log ERROR "Full reboot required before external-state layout can activate"
+    exit 75
 fi
+
+ensure_overlayfsx_data_dir || {
+    log ERROR "Failed to initialize external OverlayFSx state directory"
+    exit 1
+}
+
+if [ ! -f "$IMG_FILE" ]; then
+    migrate_legacy_image_if_needed || {
+        rc=$?
+        log ERROR "Persistent modules image unavailable (rc=$rc)"
+        exit "$rc"
+    }
+fi
+
+# Ensure ext4 image is mounted externally, never below the metamodule path.
+ensure_image_mounted || exit $?
 
 BINARY="$META_DIR/overlayfsx"
 if [ ! -f "$BINARY" ]; then
@@ -137,9 +152,6 @@ fi
 
 # Mount ViPER only at audio_effects config files and soundfx directories.
 if [ "$V4A_ACTIVE" -eq 1 ]; then
-    # Staged updates can replace a work_cfg backing inode while an older bind
-    # remains attached to the deleted inode. Remove only those stale ViPER
-    # binds so the granular mount pass can recreate them from current payloads.
     v4a_cleanup_deleted_binds || {
         log ERROR "Failed to remove stale deleted-backed ViPER bind(s)"
         exit 76
@@ -150,9 +162,6 @@ if [ "$V4A_ACTIVE" -eq 1 ]; then
         exit 76
     }
 
-    # Late-load may happen after Samsung's QTI Effect Factory has already
-    # parsed audio_effects*.xml. If the live Factory still does not map the
-    # ViPER AIDL library, restart only the audio stack and verify the new HAL.
     v4a_reload_audio_stack_if_needed || {
         log ERROR "ViPER mounts are live but audio stack reload/verification failed"
         exit 77
@@ -182,4 +191,5 @@ if echo "$INSPECT_JSON" | grep -q '"status": "success"'; then
     modify_prop "description" "$NEW_DESC" "$META_DIR/module.prop"
 fi
 
+log INFO "Persistent state: $OVERLAYFSX_DATA_DIR"
 exit 0

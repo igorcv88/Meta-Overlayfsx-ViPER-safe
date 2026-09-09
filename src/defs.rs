@@ -1,8 +1,10 @@
 // Constants for KernelSU module mounting
 
-// Dual-directory support for ext4 image
+// Metadata follows KernelSU's module directory, while mutable content lives in
+// persistent storage outside the metamodule directory so module updates cannot
+// be blocked by a live mountpoint below /data/adb/modules/<metamodule-id>.
 pub const MODULE_METADATA_DIR: &str = "/data/adb/modules/";
-pub const MODULE_CONTENT_DIR: &str = "/data/adb/metamodule/mnt/";
+pub const MODULE_CONTENT_DIR: &str = "/data/adb/overlayfsx-data/mnt/";
 
 // Legacy constant (for backwards compatibility)
 pub const _MODULE_DIR: &str = "/data/adb/modules/";

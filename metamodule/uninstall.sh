@@ -4,40 +4,63 @@
 # Cleanup script for metamodule removal
 ############################################
 
-MODDIR="${0%/*}"
-MNT_DIR="$MODDIR/mnt"
+DATA_DIR="/data/adb/overlayfsx-data"
+IMG_FILE="$DATA_DIR/modules.img"
+MNT_DIR="$DATA_DIR/mnt"
+TMP_MNT="$DATA_DIR/uninstall-mnt.$$"
+LEGACY_MNT="/data/adb/metamodule/mnt"
 
-if [ -f "$MODDIR/modules.img" ]; then
-    # Create mount directory
-    mkdir -p "$MNT_DIR"
+# Disable modules whose payloads depend on this metamodule before removing the
+# external image. Prefer the already-mounted image; otherwise mount it briefly.
+SCAN_DIR=""
+MOUNTED_TEMP=0
 
-    chcon u:object_r:ksu_file:s0 "$MODDIR/modules.img" 2>/dev/null
-    if mount -t ext4 -o loop,rw,noatime "$MODDIR/modules.img" "$MNT_DIR" 2>/dev/null; then
-        # Find all modules in the meta image
-        for module_dir in "$MNT_DIR"/*; do
-            if [ -d "$module_dir" ] && [ "$(basename "$module_dir")" != "lost+found" ]; then
-                MODULE_NAME=$(basename "$module_dir")
-                MODULE_DISABLE_FLAG="/data/adb/modules/$MODULE_NAME/disable"
-                MODULE_REAL_DIR="/data/adb/modules/$MODULE_NAME"
-
-                # Only disable if the module actually exists in /data/adb/modules/
-                if [ -d "$MODULE_REAL_DIR" ]; then
-                    touch "$MODULE_DISABLE_FLAG" 2>/dev/null
-                fi
-            fi
-        done
-
-        # Unmount after cleanup
-        umount "$MNT_DIR" 2>/dev/null || umount -l "$MNT_DIR" 2>/dev/null
+if mountpoint -q "$MNT_DIR" 2>/dev/null; then
+    SCAN_DIR="$MNT_DIR"
+elif [ -f "$IMG_FILE" ]; then
+    mkdir -p "$TMP_MNT"
+    chcon u:object_r:ksu_file:s0 "$IMG_FILE" 2>/dev/null
+    if mount -t ext4 -o loop,rw,noatime "$IMG_FILE" "$TMP_MNT" 2>/dev/null; then
+        SCAN_DIR="$TMP_MNT"
+        MOUNTED_TEMP=1
     fi
 fi
 
-# Also unmount the main mount if it exists (from metamount.sh)
-if mountpoint -q "$MNT_DIR" 2>/dev/null; then
-    umount "$MNT_DIR" 2>/dev/null || umount -l "$MNT_DIR" 2>/dev/null
+if [ -n "$SCAN_DIR" ]; then
+    for module_dir in "$SCAN_DIR"/*; do
+        [ -d "$module_dir" ] || continue
+        module_name=$(basename "$module_dir")
+        [ "$module_name" = "lost+found" ] && continue
+        case "$module_name" in *_update) module_name="${module_name%_update}" ;; esac
+        if [ -d "/data/adb/modules/$module_name" ]; then
+            touch "/data/adb/modules/$module_name/disable" 2>/dev/null
+        fi
+    done
 fi
 
-# Clean up mount directory
-rmdir "$MNT_DIR" 2>/dev/null
+if [ "$MOUNTED_TEMP" = "1" ]; then
+    umount "$TMP_MNT" 2>/dev/null || true
+    rmdir "$TMP_MNT" 2>/dev/null
+fi
+
+# A live external mount should normally be absent when KernelSU prunes the
+# metamodule on a fresh boot. Do not force/lazy-unmount it if it is unexpectedly
+# busy; leaving state behind is safer than tearing backing storage out from
+# under active OverlayFS/bind mounts.
+if mountpoint -q "$MNT_DIR" 2>/dev/null; then
+    if ! umount "$MNT_DIR" 2>/dev/null; then
+        echo "[overlayfsx] external image still busy; preserving $DATA_DIR for safety" >&2
+        exit 0
+    fi
+fi
+
+rmdir "$MNT_DIR" 2>/dev/null || true
+rm -rf "$DATA_DIR" 2>/dev/null
+
+# Legacy directories should be empty after a full reboot. Never lazy-unmount a
+# legacy live mount during uninstall; preserve it until the kernel reboot clears it.
+if ! mountpoint -q "$LEGACY_MNT" 2>/dev/null; then
+    rmdir "$LEGACY_MNT" 2>/dev/null || true
+fi
 
 exit 0
